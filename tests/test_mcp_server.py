@@ -513,6 +513,216 @@ class TestHandleRequest:
         resp = handle_request({"method": "initialize", "id": 1, "params": {}})
         assert resp["result"]["protocolVersion"] == SUPPORTED_PROTOCOL_VERSIONS[-1]
 
+    def test_initialize_returns_operating_instructions(self, monkeypatch):
+        monkeypatch.setenv("MEMPALACE_CONTEXT_NAME", "dev")
+        monkeypatch.setenv("MEMPALACE_CONTEXT_WINGS", "projects, codexclaw")
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request({"method": "initialize", "id": 1, "params": {}})
+        assert resp["result"]["capabilities"]["prompts"] == {}
+        instructions = resp["result"]["instructions"]
+        assert "Context name: dev" in instructions
+        assert "Allowed/default wings: projects, codexclaw" in instructions
+        assert "pass the most specific wing" in instructions
+
+    def test_prompts_list_exposes_operating_and_profile_guides(self):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request({"method": "prompts/list", "id": 12, "params": {}})
+        prompts = resp["result"]["prompts"]
+        by_name = {p["name"]: p for p in prompts}
+        assert "mempalace-operating-guide" in by_name
+        assert "mempalace-project-guide" in by_name
+        assert "tech-architect" in by_name
+        assert "mempalace-family-guide" in by_name
+        assert "family-assistant" in by_name
+        project_args = by_name["mempalace-project-guide"]["arguments"]
+        assert {a["name"]: a["required"] for a in project_args}["project_name"] is True
+
+    def test_prompts_get_returns_wing_override(self, monkeypatch):
+        monkeypatch.setenv("MEMPALACE_CONTEXT_NAME", "family")
+        monkeypatch.setenv("MEMPALACE_CONTEXT_WINGS", "family")
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request(
+            {
+                "method": "prompts/get",
+                "id": 13,
+                "params": {
+                    "name": "mempalace-operating-guide",
+                    "arguments": {"wing": "family"},
+                },
+            }
+        )
+        msg = resp["result"]["messages"][0]
+        assert msg["role"] == "user"
+        text = msg["content"]["text"]
+        assert "Context name: family" in text
+        assert "Session wing override: family" in text
+
+    def test_project_prompt_returns_scoped_english_memory_instructions(self):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request(
+            {
+                "method": "prompts/get",
+                "id": 14,
+                "params": {
+                    "name": "mempalace-project-guide",
+                    "arguments": {"project_name": "Tmp Agent Project"},
+                },
+            }
+        )
+
+        text = resp["result"]["messages"][0]["content"]["text"]
+        assert "Active project wing: tmp_agent_project" in text
+        assert 'Always scope MemPalace reads with wing="tmp_agent_project"' in text
+        assert "distributed shared memory" in text
+        assert "multiple models" in text
+        assert "multiple developers" in text
+        assert "multiple sessions" in text
+        assert 'Use hall="code" as read-only source of truth' in text
+        assert (
+            'Write decisions, ADRs, requirements, blockers, and task checkpoints to hall="decision"'
+            in text
+        )
+        assert "Use English for memory content and metadata" in text
+        assert "Do not browse unrelated wings" in text
+
+    def test_tech_architect_prompt_alias_uses_project_name(self):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request(
+            {
+                "method": "prompts/get",
+                "id": 15,
+                "params": {
+                    "name": "tech-architect",
+                    "arguments": {"project_name": "hexnest"},
+                },
+            }
+        )
+
+        text = resp["result"]["messages"][0]["content"]["text"]
+        assert "Active project wing: hexnest" in text
+        assert "Use English for memory content and metadata" in text
+
+    def test_project_prompt_requires_project_name(self):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request(
+            {
+                "method": "prompts/get",
+                "id": 16,
+                "params": {"name": "mempalace-project-guide", "arguments": {}},
+            }
+        )
+
+        assert resp["error"]["code"] == -32602
+        assert "project_name" in resp["error"]["message"]
+
+    def test_family_prompt_returns_english_private_memory_instructions(self):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request(
+            {
+                "method": "prompts/get",
+                "id": 17,
+                "params": {"name": "mempalace-family-guide", "arguments": {}},
+            }
+        )
+
+        text = resp["result"]["messages"][0]["content"]["text"]
+        assert "Active private wing: family" in text
+        assert "Use English for memory content and metadata" in text
+        assert "Do not browse or mention engineering project wings" in text
+
+    def test_family_assistant_prompt_alias(self):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request(
+            {
+                "method": "prompts/get",
+                "id": 18,
+                "params": {"name": "family-assistant", "arguments": {}},
+            }
+        )
+
+        text = resp["result"]["messages"][0]["content"]["text"]
+        assert "Active private wing: family" in text
+
+    def test_resources_list_exposes_guide_resources(self):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request({"method": "resources/list", "id": 19, "params": {}})
+        resources = resp["result"]["resources"]
+        by_uri = {r["uri"]: r for r in resources}
+        assert "mempalace://guides/operating" in by_uri
+        assert "mempalace://guides/family" in by_uri
+
+    def test_resource_templates_list_exposes_project_guide_template(self):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request({"method": "resources/templates/list", "id": 20, "params": {}})
+        templates = resp["result"]["resourceTemplates"]
+        by_name = {t["name"]: t for t in templates}
+        assert "mempalace-project-guide" in by_name
+        assert by_name["mempalace-project-guide"]["uriTemplate"] == (
+            "mempalace://guides/project/{project_name}"
+        )
+
+    def test_resources_read_project_guide_returns_distributed_memory_guidance(self):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request(
+            {
+                "method": "resources/read",
+                "id": 21,
+                "params": {"uri": "mempalace://guides/project/Tmp Agent Project"},
+            }
+        )
+        text = resp["result"]["contents"][0]["text"]
+        assert "Active project wing: tmp_agent_project" in text
+        assert "distributed shared memory" in text
+        assert "multiple models" in text
+
+    def test_tools_list_exposes_guide_wrapper_tools(self):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request({"method": "tools/list", "id": 22, "params": {}})
+        tool_names = {tool["name"] for tool in resp["result"]["tools"]}
+        assert "mempalace_get_operating_guide" in tool_names
+        assert "mempalace_get_project_guide" in tool_names
+        assert "mempalace_get_family_guide" in tool_names
+
+    def test_tools_call_project_guide_returns_distributed_memory_guidance(self):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request(
+            {
+                "method": "tools/call",
+                "id": 23,
+                "params": {
+                    "name": "mempalace_get_project_guide",
+                    "arguments": {"project_name": "Tmp Agent Project"},
+                },
+            }
+        )
+        content = json.loads(resp["result"]["content"][0]["text"])
+        text = content["text"]
+        assert "Active project wing: tmp_agent_project" in text
+        assert "distributed shared memory" in text
+        assert "multiple developers" in text
+
+    def test_initialize_instructions_point_to_multiple_guide_surfaces(self):
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request({"method": "initialize", "id": 24, "params": {}})
+        instructions = resp["result"]["instructions"]
+        assert "prompts" in instructions.lower()
+        assert "resources" in instructions.lower()
+        assert "tools" in instructions.lower()
+
     def test_notifications_initialized_returns_none(self):
         from mempalace.mcp_server import handle_request
 
@@ -536,6 +746,16 @@ class TestHandleRequest:
         assert "mempalace_search" in names
         assert "mempalace_add_drawer" in names
         assert "mempalace_kg_add" in names
+
+    def test_tools_list_schemas_are_codex_compatible(self):
+        from mempalace.mcp_server import handle_request
+
+        forbidden_top_level = {"oneOf", "anyOf", "allOf", "enum", "const", "not"}
+        resp = handle_request({"method": "tools/list", "id": 2, "params": {}})
+        for tool in resp["result"]["tools"]:
+            schema = tool["inputSchema"]
+            assert schema.get("type") == "object", tool["name"]
+            assert not (forbidden_top_level & set(schema)), tool["name"]
 
     def test_null_arguments_does_not_hang(self, monkeypatch, config, palace_path, seeded_kg):
         """Sending arguments: null should return a result, not hang (#394)."""
@@ -651,6 +871,286 @@ class TestHandleRequest:
         assert "result" in resp
         content = json.loads(resp["result"]["content"][0]["text"])
         assert "total_drawers" in content
+
+
+class TestAccessProfiles:
+    def _common_profile(self, monkeypatch):
+        monkeypatch.setenv("MEMPALACE_ACCESS_PROFILE", "common")
+        monkeypatch.setenv("MEMPALACE_ALLOWED_WINGS", "project,notes")
+        monkeypatch.setenv("MEMPALACE_DENIED_WINGS", "family")
+
+    def _call_tool(self, tool_name, arguments=None):
+        from mempalace.mcp_server import handle_request
+
+        return handle_request(
+            {
+                "method": "tools/call",
+                "id": 42,
+                "params": {"name": tool_name, "arguments": arguments or {}},
+            }
+        )
+
+    def test_owner_profile_keeps_family_prompt_and_tools_visible(self, monkeypatch):
+        monkeypatch.setenv("MEMPALACE_ACCESS_PROFILE", "owner")
+        from mempalace.mcp_server import handle_request
+
+        prompts = handle_request({"method": "prompts/list", "id": 1, "params": {}})["result"][
+            "prompts"
+        ]
+        prompt_names = {p["name"] for p in prompts}
+        assert "mempalace-family-guide" in prompt_names
+
+        tools = handle_request({"method": "tools/list", "id": 2, "params": {}})["result"]["tools"]
+        tool_names = {t["name"] for t in tools}
+        assert "mempalace_kg_query" in tool_names
+
+    def test_common_profile_hides_and_denies_family_prompts(self, monkeypatch):
+        self._common_profile(monkeypatch)
+        from mempalace.mcp_server import handle_request
+
+        prompts = handle_request({"method": "prompts/list", "id": 1, "params": {}})["result"][
+            "prompts"
+        ]
+        prompt_names = {p["name"] for p in prompts}
+        assert "mempalace-family-guide" not in prompt_names
+        assert "family-assistant" not in prompt_names
+
+        resp = handle_request(
+            {
+                "method": "prompts/get",
+                "id": 2,
+                "params": {"name": "mempalace-family-guide", "arguments": {}},
+            }
+        )
+        assert resp["error"]["code"] == -32001
+        assert "not allowed" in resp["error"]["message"].lower()
+
+    def test_common_profile_hides_family_resources_and_guide_tool(self, monkeypatch):
+        self._common_profile(monkeypatch)
+        from mempalace.mcp_server import handle_request
+
+        resources = handle_request({"method": "resources/list", "id": 25, "params": {}})["result"][
+            "resources"
+        ]
+        resource_uris = {r["uri"] for r in resources}
+        assert "mempalace://guides/family" not in resource_uris
+
+        tools = handle_request({"method": "tools/list", "id": 26, "params": {}})["result"]["tools"]
+        tool_names = {t["name"] for t in tools}
+        assert "mempalace_get_family_guide" not in tool_names
+
+    def test_common_profile_denies_family_project_prompt(self, monkeypatch):
+        self._common_profile(monkeypatch)
+        from mempalace.mcp_server import handle_request
+
+        resp = handle_request(
+            {
+                "method": "prompts/get",
+                "id": 3,
+                "params": {
+                    "name": "mempalace-project-guide",
+                    "arguments": {"project_name": "family"},
+                },
+            }
+        )
+        assert resp["error"]["code"] == -32001
+
+    def test_common_profile_filters_global_wing_aggregates(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        self._common_profile(monkeypatch)
+        _patch_mcp_server(monkeypatch, config, kg)
+        collection.add(
+            ids=["drawer_project_public", "drawer_family_private"],
+            documents=["public project memory", "private family memory"],
+            metadatas=[
+                {"wing": "project", "room": "backend"},
+                {"wing": "family", "room": "preferences"},
+            ],
+        )
+
+        from mempalace import mcp_server
+
+        status = mcp_server.tool_status()
+        assert status["total_drawers"] == 1
+        assert status["wings"] == {"project": 1}
+        assert status["rooms"] == {"backend": 1}
+
+        wings = mcp_server.tool_list_wings()
+        assert wings["wings"] == {"project": 1}
+
+        taxonomy = mcp_server.tool_get_taxonomy()
+        assert taxonomy["taxonomy"] == {"project": {"backend": 1}}
+
+    def test_common_profile_filters_sqlite_status_fallback(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        self._common_profile(monkeypatch)
+        _patch_mcp_server(monkeypatch, config, kg)
+        collection.add(
+            ids=["drawer_project_public", "drawer_family_private"],
+            documents=["public project memory", "private family memory"],
+            metadatas=[
+                {"wing": "project", "room": "backend"},
+                {"wing": "family", "room": "preferences"},
+            ],
+        )
+
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_vector_disabled_reason", "test divergence")
+        monkeypatch.setattr(
+            mcp_server,
+            "_vector_capacity_status",
+            {"sqlite_count": 2, "hnsw_count": 1, "divergence": 1},
+        )
+        status = mcp_server._tool_status_via_sqlite()
+
+        assert status["total_drawers"] == 1
+        assert status["wings"] == {"project": 1}
+        assert status["rooms"] == {"backend": 1}
+        assert status["vector_disabled"] is True
+
+    def test_common_profile_uses_shared_safe_guidance(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        self._common_profile(monkeypatch)
+        _patch_mcp_server(monkeypatch, config, kg)
+        collection.add(
+            ids=["drawer_project_public", "drawer_family_private"],
+            documents=["public project memory", "private family memory"],
+            metadatas=[
+                {"wing": "project", "room": "backend"},
+                {"wing": "family", "room": "preferences"},
+            ],
+        )
+
+        from mempalace import mcp_server
+
+        init = mcp_server.handle_request(
+            {
+                "method": "initialize",
+                "id": 1,
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "1"},
+                },
+            }
+        )
+        instructions = init["result"]["instructions"].lower()
+        assert "family" not in instructions
+        assert "private" not in instructions
+
+        status = mcp_server.tool_status()
+        status_text = json.dumps(status).lower()
+        assert status["total_drawers"] == 1
+        assert "family" not in status_text
+        assert "private" not in status_text
+        assert "mempalace_kg_query" not in status_text
+        assert "diary" not in status_text
+
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments"),
+        [
+            ("mempalace_search", {"query": "private", "wing": "family"}),
+            ("mempalace_list_rooms", {"wing": "family"}),
+            ("mempalace_list_drawers", {"wing": "family"}),
+            ("mempalace_add_drawer", {"wing": "family", "room": "r", "content": "secret"}),
+            ("mempalace_mine", {"source": "/tmp", "wing": "family", "dry_run": True}),
+            ("mempalace_sync", {"wing": "family", "apply": False}),
+        ],
+    )
+    def test_common_profile_denies_family_wing_tools(self, monkeypatch, tool_name, arguments):
+        self._common_profile(monkeypatch)
+
+        resp = self._call_tool(tool_name, arguments)
+        assert resp["error"]["code"] == -32001
+        assert "family" in resp["error"]["message"]
+
+    @pytest.mark.parametrize(
+        "tool_name",
+        [
+            "mempalace_kg_query",
+            "mempalace_kg_stats",
+            "mempalace_traverse",
+            "mempalace_find_tunnels",
+            "mempalace_graph_stats",
+            "mempalace_list_tunnels",
+            "mempalace_list_hallways",
+            "mempalace_check_duplicate",
+            "mempalace_diary_read",
+            "mempalace_diary_write",
+            "mempalace_hook_settings",
+            "mempalace_memories_filed_away",
+            "mempalace_reconnect",
+        ],
+    )
+    def test_common_profile_hides_and_denies_unscoped_tools(self, monkeypatch, tool_name):
+        self._common_profile(monkeypatch)
+        from mempalace.mcp_server import handle_request
+
+        tools = handle_request({"method": "tools/list", "id": 1, "params": {}})["result"]["tools"]
+        assert tool_name not in {t["name"] for t in tools}
+
+        resp = self._call_tool(tool_name, {"query": "x", "entity": "Alice", "start_room": "r"})
+        assert resp["error"]["code"] == -32001
+
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments"),
+        [
+            ("mempalace_search", {"query": "anything"}),
+            ("mempalace_list_rooms", {}),
+            ("mempalace_list_drawers", {}),
+            ("mempalace_mine", {"source": "/tmp", "dry_run": True}),
+            ("mempalace_sync", {"apply": False}),
+        ],
+    )
+    def test_common_profile_denies_unscoped_wing_required_tools(
+        self, monkeypatch, tool_name, arguments
+    ):
+        self._common_profile(monkeypatch)
+
+        resp = self._call_tool(tool_name, arguments)
+        assert resp["error"]["code"] == -32001
+        assert "wing is required" in resp["error"]["message"]
+
+    def test_common_profile_get_drawer_denies_family_metadata(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        self._common_profile(monkeypatch)
+        _patch_mcp_server(monkeypatch, config, kg)
+        collection.add(
+            ids=["drawer_family_private"],
+            documents=["private family memory"],
+            metadatas=[{"wing": "family", "room": "preferences"}],
+        )
+
+        from mempalace.mcp_server import tool_get_drawer
+
+        result = tool_get_drawer("drawer_family_private")
+        assert result["error"] == "Access denied"
+
+    def test_common_profile_update_and_delete_deny_family_metadata(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        self._common_profile(monkeypatch)
+        _patch_mcp_server(monkeypatch, config, kg)
+        collection.add(
+            ids=["drawer_family_private"],
+            documents=["private family memory"],
+            metadatas=[{"wing": "family", "room": "preferences"}],
+        )
+
+        from mempalace.mcp_server import tool_delete_drawer, tool_update_drawer
+
+        update = tool_update_drawer("drawer_family_private", content="changed")
+        delete = tool_delete_drawer("drawer_family_private")
+
+        assert update["success"] is False
+        assert update["error"] == "Access denied"
+        assert delete["success"] is False
+        assert delete["error"] == "Access denied"
 
 
 # ── Read Tools ──────────────────────────────────────────────────────────
@@ -892,7 +1392,27 @@ class TestNoneMetadataSafety:
         # Missing metadata reduces to empty defaults — no crash, no leak.
         assert result["wing"] == ""
         assert result["room"] == ""
+        assert result["hall"] == ""
         assert result["content"] == "verbatim body"
+
+    def test_get_drawer_surfaces_hall_metadata(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from unittest.mock import MagicMock
+
+        from mempalace import mcp_server
+
+        stub_col = MagicMock()
+        stub_col.get.return_value = {
+            "ids": ["drawer_with_hall"],
+            "documents": ["verbatim body"],
+            "metadatas": [{"wing": "w", "room": "r", "hall": "technical"}],
+        }
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
+
+        result = mcp_server.tool_get_drawer("drawer_with_hall")
+
+        assert result["hall"] == "technical"
+        assert result["metadata"]["hall"] == "technical"
 
     def test_list_drawers_tolerates_none_metadata(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -913,8 +1433,29 @@ class TestNoneMetadataSafety:
         assert result["count"] == 2
         assert result["drawers"][0]["wing"] == ""
         assert result["drawers"][0]["room"] == ""
+        assert result["drawers"][0]["hall"] == ""
         assert result["drawers"][1]["wing"] == "ok"
         assert result["drawers"][1]["room"] == "fine"
+        assert result["drawers"][1]["hall"] == ""
+
+    def test_list_drawers_surfaces_hall_metadata(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from unittest.mock import MagicMock
+
+        from mempalace import mcp_server
+
+        stub_col = MagicMock()
+        stub_col.get.return_value = {
+            "ids": ["drawer_with_hall"],
+            "documents": ["body"],
+            "metadatas": [{"wing": "w", "room": "r", "hall": "technical"}],
+        }
+        stub_col.count.return_value = 1
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: stub_col)
+
+        result = mcp_server.tool_list_drawers()
+
+        assert result["drawers"][0]["hall"] == "technical"
 
     def test_update_drawer_tolerates_none_metadata(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -1167,16 +1708,111 @@ class TestWriteTools:
         _client, _col = _get_collection(palace_path, create=True)
         del _client
         from mempalace.mcp_server import tool_add_drawer
+        from mempalace.miner import detect_hall
 
+        content = "This is a test memory about Python decorators and metaclasses."
         result = tool_add_drawer(
             wing="test_wing",
             room="test_room",
-            content="This is a test memory about Python decorators and metaclasses.",
+            content=content,
         )
         assert result["success"] is True
         assert result["wing"] == "test_wing"
         assert result["room"] == "test_room"
         assert result["drawer_id"].startswith("drawer_test_wing_test_room_")
+
+        stored = _col.get(ids=[result["drawer_id"]], include=["metadatas"])
+        assert stored["metadatas"][0]["hall"] == detect_hall(content)
+
+    def test_add_drawer_explicit_hall_overrides_detected_hall(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        content = "Python function bug in the API handler would normally classify as technical."
+        result = tool_add_drawer(
+            wing="test_wing",
+            room="test_room",
+            content=content,
+            hall="decision",
+        )
+
+        assert result["success"] is True
+        stored = col.get(ids=[result["drawer_id"]], include=["metadatas"])
+        assert stored["metadatas"][0]["hall"] == "decision"
+
+    def test_add_drawer_blank_hall_falls_back_to_detected_hall(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+        from mempalace.miner import detect_hall
+
+        content = "Python function bug in the API handler."
+        result = tool_add_drawer(
+            wing="test_wing",
+            room="test_room",
+            content=content,
+            hall="",
+        )
+
+        assert result["success"] is True
+        stored = col.get(ids=[result["drawer_id"]], include=["metadatas"])
+        assert stored["metadatas"][0]["hall"] == detect_hall(content)
+
+    def test_add_drawer_invalid_hall_returns_structured_error(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_add_drawer
+
+        result = tool_add_drawer(wing="w", room="r", content="content", hall="../bad")
+
+        assert result["success"] is False
+        assert "hall" in result["error"]
+
+    def test_add_drawer_schema_declares_hall_parameter(self):
+        from mempalace import mcp_server
+
+        props = mcp_server.TOOLS["mempalace_add_drawer"]["input_schema"]["properties"]
+
+        assert "hall" in props
+        assert props["hall"]["type"] == "string"
+        assert "hall" not in mcp_server.TOOLS["mempalace_add_drawer"]["input_schema"]["required"]
+
+    def test_add_drawer_schema_accepts_hall_parameter(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        captured = {}
+
+        def fake_add_drawer(wing, room, content, hall=None):
+            captured.update({"wing": wing, "room": room, "content": content, "hall": hall})
+            return {"success": True, "drawer_id": "d1"}
+
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_add_drawer"], "handler", fake_add_drawer)
+
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 99,
+                "params": {
+                    "name": "mempalace_add_drawer",
+                    "arguments": {
+                        "wing": "w",
+                        "room": "r",
+                        "content": "content",
+                        "hall": "decision",
+                    },
+                },
+            }
+        )
+
+        assert "error" not in resp
+        assert captured["hall"] == "decision"
 
     def test_add_drawer_duplicate_detection(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)

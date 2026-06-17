@@ -58,6 +58,7 @@ from .config import (  # noqa: E402
     MempalaceConfig,
     sanitize_kg_value,
     sanitize_name,
+    normalize_wing_name,
     sanitize_content,
     sanitize_iso_temporal,
     strip_lone_surrogates,
@@ -96,6 +97,7 @@ from .hallways import (  # noqa: E402
 from .knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
 from .collision_scan import assert_no_collisions  # noqa: E402
 from .ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
+from .miner import detect_hall  # noqa: E402
 
 
 def _init_logging() -> None:
@@ -950,33 +952,29 @@ def _tool_status_via_sqlite() -> dict:
     try:
         conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
-            row = conn.execute(
+            for _drawer_id, wing, room in conn.execute(
                 """
-                SELECT COUNT(*)
+                SELECT e.id,
+                       MAX(CASE WHEN em.key = 'wing' THEN em.string_value END) AS wing,
+                       MAX(CASE WHEN em.key = 'room' THEN em.string_value END) AS room
                 FROM embeddings e
                 JOIN segments s ON e.segment_id = s.id
                 JOIN collections c ON s.collection = c.id
+                LEFT JOIN embedding_metadata em
+                  ON em.id = e.id
+                 AND em.key IN ('wing', 'room')
                 WHERE c.name = ?
+                GROUP BY e.id
                 """,
                 (collection_name,),
-            ).fetchone()
-            total = int(row[0]) if row and row[0] is not None else 0
-            for key, target in (("wing", wings), ("room", rooms)):
-                for value, count in conn.execute(
-                    """
-                    SELECT em.string_value, COUNT(*)
-                    FROM embedding_metadata em
-                    JOIN embeddings e ON em.id = e.id
-                    JOIN segments s ON e.segment_id = s.id
-                    JOIN collections c ON s.collection = c.id
-                    WHERE c.name = ?
-                      AND em.key = ?
-                      AND em.string_value IS NOT NULL
-                    GROUP BY em.string_value
-                    """,
-                    (collection_name, key),
-                ):
-                    target[value] = count
+            ):
+                if _is_restricted_profile() and not _is_wing_allowed(wing):
+                    continue
+                total += 1
+                if wing is not None:
+                    wings[wing] = wings.get(wing, 0) + 1
+                if room is not None:
+                    rooms[room] = rooms.get(room, 0) + 1
         finally:
             conn.close()
     except _sqlite3.Error:
@@ -986,8 +984,8 @@ def _tool_status_via_sqlite() -> dict:
         "total_drawers": total,
         "wings": wings,
         "rooms": rooms,
-        "protocol": PALACE_PROTOCOL,
-        "aaak_dialect": AAAK_SPEC,
+        "protocol": _visible_palace_protocol(),
+        "aaak_dialect": _visible_aaak_spec(),
         "backend": "chroma",
         "vector_disabled": True,
         "vector_disabled_reason": _vector_disabled_reason,
@@ -1018,20 +1016,22 @@ def tool_status():
     col = _get_collection(create=db_exists)
     if not col:
         return _collection_error_or_no_palace()
-    count = col.count()
     wings = {}
     rooms = {}
     result = {
-        "total_drawers": count,
+        "total_drawers": col.count(),
         "wings": wings,
         "rooms": rooms,
-        "protocol": PALACE_PROTOCOL,
-        "aaak_dialect": AAAK_SPEC,
+        "protocol": _visible_palace_protocol(),
+        "aaak_dialect": _visible_aaak_spec(),
         "backend": _selected_backend_name(),
     }
     try:
         all_meta = _get_cached_metadata(col)
-        for m in all_meta:
+        visible_meta = _filter_allowed_metadata(all_meta)
+        if _is_restricted_profile():
+            result["total_drawers"] = len(visible_meta)
+        for m in visible_meta:
             m = m or {}
             w = m.get("wing", "unknown")
             r = m.get("room", "unknown")
@@ -1085,7 +1085,7 @@ def tool_list_wings():
     result = {"wings": wings}
     try:
         all_meta = _get_cached_metadata(col)
-        for m in all_meta:
+        for m in _filter_allowed_metadata(all_meta):
             m = m or {}
             w = m.get("wing", "unknown")
             wings[w] = wings.get(w, 0) + 1
@@ -1101,6 +1101,9 @@ def tool_list_rooms(wing: str = None):
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
+    denied = _require_allowed_wing(wing) if _is_restricted_profile() else None
+    if denied:
+        return denied
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
@@ -1109,7 +1112,7 @@ def tool_list_rooms(wing: str = None):
     try:
         where = {"wing": wing} if wing else None
         all_meta = _fetch_all_metadata(col, where=where)
-        for m in all_meta:
+        for m in _filter_allowed_metadata(all_meta):
             m = m or {}
             r = m.get("room", "unknown")
             rooms[r] = rooms.get(r, 0) + 1
@@ -1128,7 +1131,7 @@ def tool_get_taxonomy():
     result = {"taxonomy": taxonomy}
     try:
         all_meta = _get_cached_metadata(col)
-        for m in all_meta:
+        for m in _filter_allowed_metadata(all_meta):
             m = m or {}
             w = m.get("wing", "unknown")
             r = m.get("room", "unknown")
@@ -1157,6 +1160,9 @@ def tool_search(
         room = _sanitize_optional_name(room, "room")
     except ValueError as e:
         return {"error": str(e)}
+    denied = _require_allowed_wing(wing) if _is_restricted_profile() else None
+    if denied:
+        return denied
     # Backwards compat: accept old name
     # Backwards compat: convert old similarity scale (higher=stricter) to
     # distance scale (lower=stricter). Similarity 0.8 → distance 0.2.
@@ -1272,6 +1278,24 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
 def tool_get_aaak_spec():
     """Return the AAAK dialect specification."""
     return {"aaak_spec": AAAK_SPEC}
+
+
+def tool_get_operating_guide(wing: str = ""):
+    """Return the operating guide text for clients that can only call tools."""
+    args = {}
+    if wing:
+        args["wing"] = wing
+    return _guide_tool_payload("mempalace-operating-guide", args)
+
+
+def tool_get_project_guide(project_name: str):
+    """Return the technical project guide text for tool-only clients."""
+    return _guide_tool_payload("mempalace-project-guide", {"project_name": project_name})
+
+
+def tool_get_family_guide():
+    """Return the family guide text for tool-only clients."""
+    return _guide_tool_payload("mempalace-family-guide", {})
 
 
 def tool_traverse_graph(start_room: str, max_hops: int = 2):
@@ -1391,7 +1415,12 @@ def tool_follow_tunnels(wing: str, room: str):
 
 
 def tool_add_drawer(
-    wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str = None,
+    added_by: str = "mcp",
+    hall: str = None,
 ):
     """File verbatim content into a wing/room. Checks for duplicates first.
 
@@ -1410,11 +1439,15 @@ def tool_add_drawer(
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
         content = sanitize_content(content)
+        hall = _sanitize_optional_name(hall, "hall")
         if source_file:
             source_file = strip_lone_surrogates(source_file)
         added_by = strip_lone_surrogates(added_by)
     except ValueError as e:
         return {"success": False, "error": str(e)}
+    denied = _require_allowed_wing(wing)
+    if denied:
+        return _access_denied_success(denied["error"])
 
     col = _get_collection(create=True)
     if not col:
@@ -1435,9 +1468,11 @@ def tool_add_drawer(
     )
 
     chunk_size = _config.chunk_size
+    hall = hall or detect_hall(content)
     base_meta = {
         "wing": wing,
         "room": room,
+        "hall": hall,
         "source_file": source_file or "",
         "added_by": added_by,
         "filed_at": datetime.now().isoformat(),
@@ -1536,17 +1571,19 @@ def tool_delete_drawer(drawer_id: str):
     existing = col.get(ids=[drawer_id])
     if not existing["ids"]:
         return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+    existing_meta = _safe_meta(
+        existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
+    )
+    if not _is_wing_allowed(existing_meta.get("wing")):
+        return _access_denied_success()
 
     # Log the deletion with the content being removed for audit trail
     deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
-    deleted_meta = _safe_meta(
-        existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
-    )
     _wal_log(
         "delete_drawer",
         {
             "drawer_id": drawer_id,
-            "deleted_meta": deleted_meta,
+            "deleted_meta": existing_meta,
             "content_preview": deleted_content[:200],
         },
     )
@@ -1666,6 +1703,14 @@ def tool_mine(
     src = os.path.expanduser(source) if source else ""
     if not src or not os.path.isdir(src):
         return {"success": False, "error": f"source directory not found: {source!r}"}
+    if _is_restricted_profile():
+        try:
+            wing = _sanitize_optional_name(wing, "wing")
+        except ValueError as exc:
+            return {"success": False, "error": str(exc), "error_class": "ValueError"}
+        denied = _require_allowed_wing(wing)
+        if denied:
+            return {"success": False, "error": denied["error"], "error_class": "AccessDenied"}
 
     def _run():
         if mode == "convos":
@@ -1776,6 +1821,14 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
     if not _config.palace_path:
         np = _no_palace()
         return {"success": False, "error": np.get("error", "no palace"), "hint": np.get("hint")}
+    if _is_restricted_profile():
+        try:
+            wing = _sanitize_optional_name(wing, "wing")
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+        denied = _require_allowed_wing(wing)
+        if denied:
+            return _access_denied_success(denied["error"])
     project_dirs = [project_dir] if project_dir else None
     try:
         try:
@@ -1816,6 +1869,8 @@ def tool_get_drawer(drawer_id: str):
             return {"error": f"Drawer not found: {drawer_id}"}
         meta = _safe_meta(result["metadatas"][0])
         doc = result["documents"][0]
+        if not _is_wing_allowed(meta.get("wing")):
+            return _access_denied()
         # source_file is the absolute filesystem path written by the
         # miners. Reduce to its basename before handing it to the MCP
         # client — same threat model as the palace_path leak fix:
@@ -1830,6 +1885,7 @@ def tool_get_drawer(drawer_id: str):
             "content": doc,
             "wing": safe_meta.get("wing", ""),
             "room": safe_meta.get("room", ""),
+            "hall": safe_meta.get("hall", ""),
             "metadata": safe_meta,
         }
     except Exception as e:
@@ -1845,6 +1901,9 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
         room = _sanitize_optional_name(room, "room")
     except ValueError as e:
         return {"error": str(e)}
+    denied = _require_allowed_wing(wing) if _is_restricted_profile() else None
+    if denied:
+        return denied
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
@@ -1881,6 +1940,7 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
                     "drawer_id": did,
                     "wing": meta.get("wing", ""),
                     "room": meta.get("room", ""),
+                    "hall": meta.get("hall", ""),
                     "content_preview": doc[:200] + "..." if len(doc) > 200 else doc,
                 }
             )
@@ -1912,6 +1972,8 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
         old_meta = _safe_meta(existing["metadatas"][0])
         old_doc = existing["documents"][0]
+        if not _is_wing_allowed(old_meta.get("wing")):
+            return _access_denied_success()
 
         new_doc = old_doc
         if content is not None:
@@ -1926,6 +1988,9 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 wing = sanitize_name(wing, "wing")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
+            denied = _require_allowed_wing(wing)
+            if denied:
+                return _access_denied_success(denied["error"])
             # Preserve existing casing when the caller passes a case-only
             # variant (LLM clients often "autocorrect" acronyms like ps5→PS5).
             if wing.lower() != str(old_meta.get("wing") or "").lower():
@@ -2538,6 +2603,38 @@ TOOLS = {
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_get_aaak_spec,
     },
+    "mempalace_get_operating_guide": {
+        "description": "Get the MemPalace operating guide through the tools surface. Use when your MCP client does not expose prompts or resources directly.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {
+                    "type": "string",
+                    "description": "Optional wing override for this session guide.",
+                }
+            },
+        },
+        "handler": tool_get_operating_guide,
+    },
+    "mempalace_get_project_guide": {
+        "description": "Get the technical project MemPalace guide through the tools surface. Use when your MCP client does not expose prompts or resources directly.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project_name": {
+                    "type": "string",
+                    "description": "Project name used to derive the active MemPalace wing.",
+                }
+            },
+            "required": ["project_name"],
+        },
+        "handler": tool_get_project_guide,
+    },
+    "mempalace_get_family_guide": {
+        "description": "Get the family/private MemPalace guide through the tools surface.",
+        "input_schema": {"type": "object", "properties": {}},
+        "handler": tool_get_family_guide,
+    },
     "mempalace_kg_query": {
         "description": "Query the knowledge graph for an entity's relationships. Returns typed facts with temporal validity. E.g. 'Max' → child_of Alice, loves chess, does swimming. Filter by date with as_of to see what was true at a point in time.",
         "input_schema": {
@@ -2810,6 +2907,10 @@ TOOLS = {
                 },
                 "source_file": {"type": "string", "description": "Where this came from (optional)"},
                 "added_by": {"type": "string", "description": "Who is filing this (default: mcp)"},
+                "hall": {
+                    "type": "string",
+                    "description": "Optional explicit hall metadata. If omitted, hall is detected from content.",
+                },
             },
             "required": ["wing", "room", "content"],
         },
@@ -2980,13 +3081,10 @@ TOOLS = {
                     "description": "Alias for 'entry' — accepted because add_drawer uses 'content'. Provide either 'entry' or 'content'; 'entry' wins if both are given.",
                 },
             },
-            # agent_name is always required; 'entry' or its alias 'content' must
-            # be present (the server remaps content->entry at dispatch).
-            "required": ["agent_name"],
-            "anyOf": [
-                {"required": ["entry"]},
-                {"required": ["content"]},
-            ],
+            # Keep the public schema OpenAI-compatible: Codex rejects top-level
+            # anyOf/oneOf/allOf. Runtime dispatch still accepts content as an
+            # alias for entry before calling the handler.
+            "required": ["agent_name", "entry"],
         },
         "handler": tool_diary_write,
     },
@@ -3060,6 +3158,532 @@ SUPPORTED_PROTOCOL_VERSIONS = [
 ]
 
 
+def _context_name() -> str:
+    return os.environ.get("MEMPALACE_CONTEXT_NAME", "").strip() or "default"
+
+
+def _context_wings() -> list[str]:
+    raw = os.environ.get("MEMPALACE_CONTEXT_WINGS", "")
+    wings = [w.strip() for w in raw.split(",") if w.strip()]
+    return wings
+
+
+def _context_require_wing() -> bool:
+    raw = os.environ.get("MEMPALACE_CONTEXT_REQUIRE_WING", "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+_ACCESS_FORBIDDEN_CODE = -32001
+_RESTRICTED_TOOL_DENYLIST = {
+    "mempalace_kg_query",
+    "mempalace_kg_add",
+    "mempalace_kg_invalidate",
+    "mempalace_kg_timeline",
+    "mempalace_kg_stats",
+    "mempalace_traverse",
+    "mempalace_find_tunnels",
+    "mempalace_graph_stats",
+    "mempalace_create_tunnel",
+    "mempalace_list_tunnels",
+    "mempalace_delete_tunnel",
+    "mempalace_list_hallways",
+    "mempalace_delete_hallway",
+    "mempalace_follow_tunnels",
+    "mempalace_check_duplicate",
+    "mempalace_diary_write",
+    "mempalace_diary_read",
+    "mempalace_hook_settings",
+    "mempalace_memories_filed_away",
+    "mempalace_reconnect",
+}
+_RESTRICTED_TOOL_WING_REQUIRED = {
+    "mempalace_search",
+    "mempalace_list_rooms",
+    "mempalace_list_drawers",
+    "mempalace_mine",
+    "mempalace_sync",
+}
+_FAMILY_PROMPTS = {"mempalace-family-guide", "family-assistant"}
+_FAMILY_GUIDE_TOOLS = {"mempalace_get_family_guide"}
+_OPERATING_GUIDE_URI = "mempalace://guides/operating"
+_FAMILY_GUIDE_URI = "mempalace://guides/family"
+_PROJECT_GUIDE_URI_TEMPLATE = "mempalace://guides/project/{project_name}"
+_GUIDE_MIME_TYPE = "text/markdown"
+
+
+def _access_profile() -> str:
+    profile = os.environ.get("MEMPALACE_ACCESS_PROFILE", "").strip().lower()
+    return profile or "owner"
+
+
+def _is_restricted_profile() -> bool:
+    return _access_profile() == "common"
+
+
+def _visible_palace_protocol() -> str:
+    if not _is_restricted_profile():
+        return PALACE_PROTOCOL
+    return """IMPORTANT — MemPalace Shared Project Memory Protocol:
+1. ON WAKE-UP: Call mempalace_status to load the shared project memory overview.
+2. BEFORE RESPONDING about a project, task, or decision: call mempalace_search with an explicit allowed wing.
+3. IF UNSURE about a project fact: say "let me check" and query the allowed project wing. Wrong is worse than slow.
+4. WHEN WRITING: store only durable project facts, requirements, decisions, blockers, and checkpoints with an explicit allowed wing.
+5. DO NOT browse unrelated wings, infer hidden context, store secrets, or use tools that are not listed for this profile."""
+
+
+def _visible_aaak_spec() -> str:
+    if not _is_restricted_profile():
+        return AAAK_SPEC
+    return """AAAK is a compact memory dialect used by MemPalace for efficient storage.
+It is designed to be readable by both humans and LLMs without decoding.
+
+FORMAT:
+  ENTITIES: short uppercase codes for project entities when useful.
+  STRUCTURE: pipe-separated fields for project, task, decision, blocker, and checkpoint records.
+  DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions.
+  IMPORTANCE: one to five stars.
+  HALLS: code, decision, facts, events, discoveries, preferences, advice.
+  WINGS: project-scoped names.
+  ROOMS: concise slugs representing named ideas, components, or decisions.
+
+Read AAAK naturally. When writing AAAK, keep structure tight and use English content and metadata."""
+
+
+def _parse_wing_env(var_name: str) -> set[str]:
+    wings: set[str] = set()
+    for raw in os.environ.get(var_name, "").split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            wings.add(sanitize_name(raw, var_name).lower())
+        except ValueError:
+            logger.warning("Ignoring invalid %s entry: %r", var_name, raw)
+    return wings
+
+
+def _allowed_wings() -> set[str]:
+    return _parse_wing_env("MEMPALACE_ALLOWED_WINGS")
+
+
+def _denied_wings() -> set[str]:
+    denied = _parse_wing_env("MEMPALACE_DENIED_WINGS")
+    if _is_restricted_profile():
+        denied.add("family")
+    return denied
+
+
+def _is_wing_allowed(wing: str | None) -> bool:
+    if not _is_restricted_profile():
+        return True
+    if not wing:
+        return False
+    wing_l = str(wing).strip().lower()
+    if wing_l in _denied_wings():
+        return False
+    allowed = _allowed_wings()
+    return not allowed or wing_l in allowed
+
+
+def _access_denied(message: str = "Access denied") -> dict:
+    return {"error": message}
+
+
+def _access_denied_success(message: str = "Access denied") -> dict:
+    return {"success": False, "error": message}
+
+
+def _jsonrpc_access_denied(req_id, message: str = "Access denied") -> dict:
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": _ACCESS_FORBIDDEN_CODE, "message": message},
+    }
+
+
+def _wing_denied_message(wing: str | None) -> str:
+    return f"Access denied for wing '{wing}'" if wing else "Access denied: wing is required"
+
+
+def _require_allowed_wing(wing: str | None) -> dict | None:
+    if _is_wing_allowed(wing):
+        return None
+    return _access_denied(_wing_denied_message(wing))
+
+
+def _filter_allowed_metadata(metadata: list) -> list:
+    if not _is_restricted_profile():
+        return metadata
+    return [m for m in metadata if _is_wing_allowed(_safe_meta(m).get("wing"))]
+
+
+def _is_tool_allowed(tool_name: str) -> bool:
+    if _is_restricted_profile() and tool_name in _RESTRICTED_TOOL_DENYLIST:
+        return False
+    if _is_restricted_profile() and tool_name in _FAMILY_GUIDE_TOOLS:
+        return False
+    return True
+
+
+def _tool_access_error(tool_name: str, tool_args: dict) -> str | None:
+    if not _is_tool_allowed(tool_name):
+        return f"Tool '{tool_name}' is not allowed"
+    if tool_name == "mempalace_get_project_guide" and _is_restricted_profile():
+        try:
+            if not _is_wing_allowed(_project_wing_from_args(tool_args)):
+                return _wing_denied_message(tool_args.get("project_name"))
+        except ValueError:
+            return None
+    if _is_restricted_profile() and tool_name in _RESTRICTED_TOOL_WING_REQUIRED:
+        if not tool_args.get("wing"):
+            return _wing_denied_message(None)
+    for wing_key in ("wing", "wing_a", "wing_b", "source_wing", "target_wing"):
+        if wing_key in tool_args and not _is_wing_allowed(tool_args.get(wing_key)):
+            return _wing_denied_message(tool_args.get(wing_key))
+    return None
+
+
+def _is_prompt_allowed(prompt_name: str, arguments: dict | None = None) -> bool:
+    if not _is_restricted_profile():
+        return True
+    if prompt_name in _FAMILY_PROMPTS:
+        return False
+    if prompt_name in PROMPTS and PROMPTS[prompt_name]["profile"] == "project":
+        try:
+            return _is_wing_allowed(_project_wing_from_args(arguments))
+        except ValueError:
+            return True
+    return True
+
+
+def _operating_guide_text() -> str:
+    wings = _context_wings()
+    wing_line = ", ".join(wings) if wings else "(not configured)"
+    require_line = (
+        "Treat the listed wings as mandatory for scoped read/write work."
+        if _context_require_wing()
+        else "Treat the listed wings as the default scope; ask before crossing into other wings."
+    )
+    lines = [
+        "MemPalace operating guide.",
+        "",
+        f"Context name: {_context_name()}",
+        f"Allowed/default wings: {wing_line}",
+        "",
+        "MemPalace is distributed shared memory for development work across multiple models, multiple developers, and multiple sessions.",
+        "Treat it as a shared knowledge plane for synchronizing durable engineering context, not as scratch memory for only one model.",
+        "Use MemPalace as verbatim memory, not as a summarization store.",
+        require_line,
+        "Project coding agents should load the MemPalace project guide using prompts, resources, or tools with project_name from AGENTS.md.",
+    ]
+    if not _is_restricted_profile():
+        lines.append("Family/private agents should load prompt mempalace-family-guide.")
+    lines.extend(
+        [
+            "If one guide surface is unavailable in your client, fall back to another: prompts, resources, or guide tools should all provide the same core instructions.",
+            "For search/list/read tools, pass the most specific wing argument whenever the tool supports it.",
+            "For write tools, always set wing explicitly and choose a concise room name.",
+            "Use English for memory content and metadata unless the user explicitly requests otherwise.",
+            "Store exact durable facts, decisions, ADRs, requirements, blockers, and checkpoints so other models and developers can reliably continue the work later. Do not store transient logs, duplicate chat dumps, secrets, or unsupported guesses.",
+            "Before writing, search or check duplicates when practical.",
+            "Do not list all wings or browse unrelated wings unless the user explicitly asks for cross-context work.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _project_prompt_arguments(required: bool) -> list[dict]:
+    return [
+        {
+            "name": "project_name",
+            "description": "Project name used to derive the active MemPalace wing.",
+            "required": required,
+        }
+    ]
+
+
+PROMPTS = {
+    "mempalace-operating-guide": {
+        "description": "Instructions for using this MemPalace MCP server safely with the configured context wings.",
+        "arguments": [
+            {
+                "name": "wing",
+                "description": "Optional wing override for this session prompt.",
+                "required": False,
+            }
+        ],
+        "profile": "operating",
+    },
+    "mempalace-project-guide": {
+        "description": "Default technical project guide for coding agents using project-scoped MemPalace memory.",
+        "arguments": _project_prompt_arguments(True),
+        "profile": "project",
+    },
+    "tech-architect": {
+        "description": "Alias for mempalace-project-guide, kept for AGENTS.md compatibility.",
+        "arguments": _project_prompt_arguments(True),
+        "profile": "project",
+    },
+    "mempalace-family-guide": {
+        "description": "Private family guide for agents scoped to the family wing.",
+        "arguments": [],
+        "profile": "family",
+    },
+    "family-assistant": {
+        "description": "Alias for mempalace-family-guide, kept for family assistant compatibility.",
+        "arguments": [],
+        "profile": "family",
+    },
+}
+
+
+def _project_wing_from_args(arguments: dict | None) -> str:
+    args = arguments or {}
+    raw_project_name = str(args.get("project_name", "")).strip()
+    if not raw_project_name:
+        raise ValueError("project_name is required for project prompt")
+    return sanitize_name(normalize_wing_name(raw_project_name), "project_name")
+
+
+def _project_guide_text(arguments: dict | None) -> str:
+    wing = _project_wing_from_args(arguments)
+    return "\n".join(
+        [
+            "MemPalace project memory guide.",
+            "",
+            f"Active project wing: {wing}",
+            "",
+            "MemPalace is distributed shared memory for development work across multiple models, multiple developers, and multiple sessions.",
+            "Use it to synchronize durable project knowledge so another model or another human can resume work without rebuilding context from scratch.",
+            "Do not treat MemPalace as scratch memory for only one session or one agent.",
+            f'Always scope MemPalace reads with wing="{wing}".',
+            "Use mempalace_search first for task context, then mempalace_get_drawer only when exact full content is needed.",
+            'Use hall="code" as read-only source of truth for mined codebase structure when present.',
+            'Do not write to hall="code" manually; only automated mining should populate it.',
+            'Write decisions, ADRs, requirements, blockers, and task checkpoints to hall="decision". Older memories may use hall="decisions".',
+            "When writing, assume the next reader may be a different model and a different developer. Prefer explicit durable facts over local shorthand.",
+            "Use English for memory content and metadata because retrieval quality is strongest in English.",
+            "Use concise lowercase English room names with underscores when possible.",
+            "Do not browse unrelated wings, list all wings, or infer cross-project facts unless the user explicitly asks.",
+        ]
+    )
+
+
+def _family_guide_text() -> str:
+    return "\n".join(
+        [
+            "MemPalace private family memory guide.",
+            "",
+            "Active private wing: family",
+            "",
+            'Always scope MemPalace reads and writes with wing="family".',
+            "Use English for memory content and metadata because retrieval quality is strongest in English.",
+            "Use rooms for durable household domains such as preferences, events, facts, health, property, travel, and finance.",
+            "Use halls such as facts, preferences, events, decisions, and documents when filing new memories.",
+            "Do not browse or mention engineering project wings unless the user explicitly asks for cross-context work.",
+            "Store only durable family facts, preferences, decisions, events, and warnings. Do not store transient chat logs or unsupported guesses.",
+        ]
+    )
+
+
+def _prompt_messages(name: str, arguments: dict | None = None) -> list[dict]:
+    text = _guide_text(name, arguments)
+    return [{"role": "user", "content": {"type": "text", "text": text}}]
+
+
+def _guide_text(name: str, arguments: dict | None = None) -> str:
+    if name not in PROMPTS:
+        raise KeyError(name)
+    profile = PROMPTS[name]["profile"]
+    if profile == "project":
+        return _project_guide_text(arguments)
+    if profile == "family":
+        return _family_guide_text()
+    args = arguments or {}
+    text = _operating_guide_text()
+    wing = str(args.get("wing", "")).strip()
+    if wing:
+        text += f"\n\nSession wing override: {wing}\nUse this wing for scoped operations unless the user says otherwise."
+    return text
+
+
+def _guide_tool_payload(name: str, arguments: dict | None = None) -> dict:
+    return {
+        "name": name,
+        "description": PROMPTS[name]["description"],
+        "text": _guide_text(name, arguments),
+    }
+
+
+def _guide_resource(uri: str, name: str, description: str) -> dict:
+    return {
+        "uri": uri,
+        "name": name,
+        "description": description,
+        "mimeType": _GUIDE_MIME_TYPE,
+    }
+
+
+def _parse_project_guide_uri(uri: str) -> dict | None:
+    prefix = "mempalace://guides/project/"
+    if not uri.startswith(prefix):
+        return None
+    project_name = uri[len(prefix) :]
+    return {"project_name": project_name}
+
+
+def _handle_resources_request(method: str, params: dict, req_id) -> dict:
+    if method == "resources/list":
+        resources = [
+            _guide_resource(
+                _OPERATING_GUIDE_URI,
+                "mempalace-operating-guide",
+                PROMPTS["mempalace-operating-guide"]["description"],
+            )
+        ]
+        if _is_prompt_allowed("mempalace-family-guide", None):
+            resources.append(
+                _guide_resource(
+                    _FAMILY_GUIDE_URI,
+                    "mempalace-family-guide",
+                    PROMPTS["mempalace-family-guide"]["description"],
+                )
+            )
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": resources}}
+    if method == "resources/templates/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "resourceTemplates": [
+                    {
+                        "name": "mempalace-project-guide",
+                        "uriTemplate": _PROJECT_GUIDE_URI_TEMPLATE,
+                        "description": PROMPTS["mempalace-project-guide"]["description"],
+                        "mimeType": _GUIDE_MIME_TYPE,
+                    }
+                ]
+            },
+        }
+    if method == "resources/read":
+        if not isinstance(params, dict) or "uri" not in params:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params: 'uri' is required for resources/read",
+                },
+            }
+        uri = str(params.get("uri", "")).strip()
+        guide_name = None
+        guide_args = None
+        if uri == _OPERATING_GUIDE_URI:
+            guide_name = "mempalace-operating-guide"
+            guide_args = {}
+        elif uri == _FAMILY_GUIDE_URI:
+            guide_name = "mempalace-family-guide"
+            guide_args = {}
+        else:
+            project_args = _parse_project_guide_uri(uri)
+            if project_args is not None:
+                guide_name = "mempalace-project-guide"
+                guide_args = project_args
+        if guide_name is None:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": f"Unknown resource: {uri}"},
+            }
+        if not _is_prompt_allowed(guide_name, guide_args):
+            return _jsonrpc_access_denied(req_id, f"Resource '{uri}' is not allowed")
+        try:
+            text = _guide_text(guide_name, guide_args)
+        except ValueError as e:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32602, "message": str(e)},
+            }
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "contents": [
+                    {
+                        "uri": uri,
+                        "mimeType": _GUIDE_MIME_TYPE,
+                        "text": text,
+                    }
+                ]
+            },
+        }
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": -32601, "message": f"Unknown method: {method}"},
+    }
+
+
+def _handle_prompts_request(method: str, params: dict, req_id) -> dict:
+    if method == "prompts/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "prompts": [
+                    {
+                        "name": name,
+                        "description": prompt["description"],
+                        "arguments": prompt["arguments"],
+                    }
+                    for name, prompt in PROMPTS.items()
+                    if _is_prompt_allowed(name, None)
+                ]
+            },
+        }
+    if method == "prompts/get":
+        if not isinstance(params, dict) or "name" not in params:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params: 'name' is required for prompts/get",
+                },
+            }
+        prompt_name = params.get("name")
+        if not _is_prompt_allowed(prompt_name, params.get("arguments") or {}):
+            return _jsonrpc_access_denied(req_id, f"Prompt '{prompt_name}' is not allowed")
+        try:
+            messages = _prompt_messages(prompt_name, params.get("arguments") or {})
+        except KeyError:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32601, "message": f"Unknown prompt: {prompt_name}"},
+            }
+        except ValueError as e:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32602, "message": str(e)},
+            }
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "description": PROMPTS[prompt_name]["description"],
+                "messages": messages,
+            },
+        }
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": -32601, "message": f"Unknown method: {method}"},
+    }
+
+
 def _internal_tool_error(req_id, tool_name: str, exc: BaseException = None) -> dict:
     logger.exception(f"Tool error in {tool_name}")
     error: dict = {"code": -32000, "message": "Internal tool error"}
@@ -3073,6 +3697,138 @@ def _internal_tool_error(req_id, tool_name: str, exc: BaseException = None) -> d
         "id": req_id,
         "error": error,
     }
+
+
+def _handle_tools_call(params: dict, req_id) -> dict:
+    if not isinstance(params, dict) or "name" not in params:
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {
+                "code": -32602,
+                "message": "Invalid params: 'name' is required for tools/call",
+            },
+        }
+    tool_name = params.get("name")
+    tool_args = params.get("arguments") or {}
+    if tool_name not in TOOLS:
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
+        }
+    if not _is_tool_allowed(tool_name):
+        return _jsonrpc_access_denied(req_id, f"Tool '{tool_name}' is not allowed")
+    # Whitelist arguments to declared schema properties only.
+    # Prevents callers from spoofing internal params like added_by/source_file.
+    # Skip filtering if handler explicitly accepts **kwargs (pass-through).
+    # Default to filtering on inspect failure (safe fallback).
+    import inspect
+
+    schema_props = TOOLS[tool_name]["input_schema"].get("properties", {})
+    try:
+        handler = TOOLS[tool_name]["handler"]
+        sig = inspect.signature(handler)
+        accepts_var_keyword = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+    except (ValueError, TypeError):
+        accepts_var_keyword = False
+    if not accepts_var_keyword:
+        # An unknown kwarg here is almost always a wrong parameter *name*
+        # (e.g. text= instead of content=). Silently dropping it makes the
+        # cause surface only indirectly as a later "Missing required 'X'",
+        # so name it explicitly — symmetric with the missing-required path
+        # below. wait_for_previous is an internal transport kwarg in no
+        # tool schema; it is popped before dispatch further down, so it
+        # must not be reported as unknown here.
+        unknown = [k for k in tool_args if k not in schema_props and k != "wait_for_previous"]
+        if unknown:
+            quoted = ", ".join(f"'{k}'" for k in unknown)
+            word = "parameter" if len(unknown) == 1 else "parameters"
+            logger.debug("Tool %s: unknown %s %s", tool_name, word, quoted)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32602,
+                    "message": f"Unknown {word} {quoted} for tool {tool_name}",
+                },
+            }
+        tool_args = {k: v for k, v in tool_args.items() if k in schema_props}
+    # Coerce argument types based on input_schema.
+    # MCP JSON transport may deliver integers as floats or strings;
+    # ChromaDB and Python slicing require native int.
+    for key, value in list(tool_args.items()):
+        prop_schema = schema_props.get(key, {})
+        declared_type = prop_schema.get("type")
+        try:
+            if declared_type == "integer" and not isinstance(value, int):
+                tool_args[key] = int(value)
+            elif declared_type == "number" and not isinstance(value, (int, float)):
+                tool_args[key] = float(value)
+        except (ValueError, TypeError):
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32602, "message": f"Invalid value for parameter '{key}'"},
+            }
+    tool_args.pop("wait_for_previous", None)
+    access_error = _tool_access_error(tool_name, tool_args)
+    if access_error:
+        return _jsonrpc_access_denied(req_id, access_error)
+    # 'content' is an accepted alias for diary_write's 'entry' (callers often
+    # reuse add_drawer's 'content' name). Map it in here, before dispatch, so a
+    # content-only call still satisfies the required 'entry' param while the
+    # signature-based missing-parameter diagnostic (-32602) keeps working.
+    # 'entry' wins if both are supplied.
+    if tool_name == "mempalace_diary_write" and "content" in tool_args:
+        content_val = tool_args.pop("content")
+        # Only fill from the alias when the caller did not supply 'entry' at
+        # all (or passed it as null). An explicit entry — even "" — wins.
+        if "entry" not in tool_args or tool_args["entry"] is None:
+            tool_args["entry"] = content_val
+    try:
+        result = TOOLS[tool_name]["handler"](**tool_args)
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [
+                    {"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}
+                ]
+            },
+        }
+    except TypeError as e:
+        # Qualname match prevents leaking internal helper/param names raised
+        # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
+        msg = str(e)
+        handler = TOOLS[tool_name]["handler"]
+        handler_qn = getattr(handler, "__qualname__", None) or getattr(handler, "__name__", "")
+        # Qualname can include "<locals>" for nested defs and "<lambda>"
+        # for lambdas — accept Python's TypeError emit verbatim.
+        m_missing = re.match(
+            r"^([\w\.<>]+)\(\) missing \d+ required "
+            r"(?:positional |keyword-only )?arguments?: (.+)$",
+            msg,
+        )
+        if m_missing and m_missing.group(1) == handler_qn:
+            names = re.findall(r"'(\w+)'", m_missing.group(2))
+            if names:
+                quoted = ", ".join(f"'{n}'" for n in names)
+                word = "parameter" if len(names) == 1 else "parameters"
+                logger.debug("Tool %s: missing required %s %s", tool_name, word, quoted)
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32602,
+                        "message": f"Missing required {word} {quoted} for tool {tool_name}",
+                    },
+                }
+        return _internal_tool_error(req_id, tool_name, e)
+    except Exception as exc:
+        return _internal_tool_error(req_id, tool_name, exc)
 
 
 def handle_request(request):
@@ -3100,8 +3856,9 @@ def handle_request(request):
             "id": req_id,
             "result": {
                 "protocolVersion": negotiated,
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "prompts": {}, "resources": {}},
                 "serverInfo": {"name": "mempalace", "version": __version__},
+                "instructions": _operating_guide_text(),
             },
         }
     elif method == "ping":
@@ -3109,6 +3866,12 @@ def handle_request(request):
     elif method.startswith("notifications/"):
         # Notifications (no id) never get a response per JSON-RPC spec
         return None
+    elif method.startswith("prompts/"):
+        return _handle_prompts_request(method, params, req_id)
+    elif method == "resources/list" or method == "resources/read":
+        return _handle_resources_request(method, params, req_id)
+    elif method == "resources/templates/list":
+        return _handle_resources_request(method, params, req_id)
     elif method == "tools/list":
         return {
             "jsonrpc": "2.0",
@@ -3117,134 +3880,12 @@ def handle_request(request):
                 "tools": [
                     {"name": n, "description": t["description"], "inputSchema": t["input_schema"]}
                     for n, t in TOOLS.items()
+                    if _is_tool_allowed(n)
                 ]
             },
         }
     elif method == "tools/call":
-        if not isinstance(params, dict) or "name" not in params:
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": {
-                    "code": -32602,
-                    "message": "Invalid params: 'name' is required for tools/call",
-                },
-            }
-        tool_name = params.get("name")
-        tool_args = params.get("arguments") or {}
-        if tool_name not in TOOLS:
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
-            }
-        # Whitelist arguments to declared schema properties only.
-        # Prevents callers from spoofing internal params like added_by/source_file.
-        # Skip filtering if handler explicitly accepts **kwargs (pass-through).
-        # Default to filtering on inspect failure (safe fallback).
-        import inspect
-
-        schema_props = TOOLS[tool_name]["input_schema"].get("properties", {})
-        try:
-            handler = TOOLS[tool_name]["handler"]
-            sig = inspect.signature(handler)
-            accepts_var_keyword = any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            )
-        except (ValueError, TypeError):
-            accepts_var_keyword = False
-        if not accepts_var_keyword:
-            # An unknown kwarg here is almost always a wrong parameter *name*
-            # (e.g. text= instead of content=). Silently dropping it makes the
-            # cause surface only indirectly as a later "Missing required 'X'",
-            # so name it explicitly — symmetric with the missing-required path
-            # below. wait_for_previous is an internal transport kwarg in no
-            # tool schema; it is popped before dispatch further down, so it
-            # must not be reported as unknown here.
-            unknown = [k for k in tool_args if k not in schema_props and k != "wait_for_previous"]
-            if unknown:
-                quoted = ", ".join(f"'{k}'" for k in unknown)
-                word = "parameter" if len(unknown) == 1 else "parameters"
-                logger.debug("Tool %s: unknown %s %s", tool_name, word, quoted)
-                return {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {
-                        "code": -32602,
-                        "message": f"Unknown {word} {quoted} for tool {tool_name}",
-                    },
-                }
-            tool_args = {k: v for k, v in tool_args.items() if k in schema_props}
-        # Coerce argument types based on input_schema.
-        # MCP JSON transport may deliver integers as floats or strings;
-        # ChromaDB and Python slicing require native int.
-        for key, value in list(tool_args.items()):
-            prop_schema = schema_props.get(key, {})
-            declared_type = prop_schema.get("type")
-            try:
-                if declared_type == "integer" and not isinstance(value, int):
-                    tool_args[key] = int(value)
-                elif declared_type == "number" and not isinstance(value, (int, float)):
-                    tool_args[key] = float(value)
-            except (ValueError, TypeError):
-                return {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32602, "message": f"Invalid value for parameter '{key}'"},
-                }
-        tool_args.pop("wait_for_previous", None)
-        # 'content' is an accepted alias for diary_write's 'entry' (callers often
-        # reuse add_drawer's 'content' name). Map it in here, before dispatch, so a
-        # content-only call still satisfies the required 'entry' param while the
-        # signature-based missing-parameter diagnostic (-32602) keeps working.
-        # 'entry' wins if both are supplied.
-        if tool_name == "mempalace_diary_write" and "content" in tool_args:
-            content_val = tool_args.pop("content")
-            # Only fill from the alias when the caller did not supply 'entry' at
-            # all (or passed it as null). An explicit entry — even "" — wins.
-            if "entry" not in tool_args or tool_args["entry"] is None:
-                tool_args["entry"] = content_val
-        try:
-            result = TOOLS[tool_name]["handler"](**tool_args)
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {
-                    "content": [
-                        {"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}
-                    ]
-                },
-            }
-        except TypeError as e:
-            # Qualname match prevents leaking internal helper/param names raised
-            # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
-            msg = str(e)
-            handler = TOOLS[tool_name]["handler"]
-            handler_qn = getattr(handler, "__qualname__", None) or getattr(handler, "__name__", "")
-            # Qualname can include "<locals>" for nested defs and "<lambda>"
-            # for lambdas — accept Python's TypeError emit verbatim.
-            m_missing = re.match(
-                r"^([\w\.<>]+)\(\) missing \d+ required "
-                r"(?:positional |keyword-only )?arguments?: (.+)$",
-                msg,
-            )
-            if m_missing and m_missing.group(1) == handler_qn:
-                names = re.findall(r"'(\w+)'", m_missing.group(2))
-                if names:
-                    quoted = ", ".join(f"'{n}'" for n in names)
-                    word = "parameter" if len(names) == 1 else "parameters"
-                    logger.debug("Tool %s: missing required %s %s", tool_name, word, quoted)
-                    return {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {
-                            "code": -32602,
-                            "message": f"Missing required {word} {quoted} for tool {tool_name}",
-                        },
-                    }
-            return _internal_tool_error(req_id, tool_name, e)
-        except Exception as exc:
-            return _internal_tool_error(req_id, tool_name, exc)
+        return _handle_tools_call(params, req_id)
 
     # Notifications (missing id) must never get a response
     if req_id is None:
@@ -3471,6 +4112,16 @@ def main():
     (``import mempalace.searcher`` from a host app) do NOT trigger this
     side effect; only the CLI/MCP entry points pop the env var.
     """
+    transport = os.environ.get("MEMPALACE_TRANSPORT", "stdio").strip().lower()
+    if transport == "http":
+        from .http_mcp import main as http_main
+
+        http_main()
+        return
+    if transport not in {"", "stdio"}:
+        raise SystemExit(
+            f"MEMPALACE_TRANSPORT must be 'stdio' or 'http', got {transport!r}"
+        )
     # Drop leaked PYTHONPATH so any subprocess this server spawns starts
     # with a clean env. The sys.path filter in mempalace/__init__.py
     # already protects this process from the same ABI mismatch; here we

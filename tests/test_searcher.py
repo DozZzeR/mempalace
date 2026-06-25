@@ -48,10 +48,35 @@ class TestSearchMemories:
         assert "text" in hit
         assert "wing" in hit
         assert "room" in hit
+        assert "hall" in hit
         assert "source_file" in hit
         assert "similarity" in hit
         assert isinstance(hit["similarity"], float)
         assert "created_at" in hit
+
+    def test_hall_contains_metadata_value(self):
+        """Search results surface drawer hall metadata when it exists."""
+        mock_col = MagicMock()
+        mock_col.query.return_value = {
+            "ids": [["drawer_with_hall"]],
+            "documents": [["Technical note about python error handling"]],
+            "metadatas": [
+                [
+                    {
+                        "wing": "project",
+                        "room": "backend",
+                        "hall": "technical",
+                        "source_file": "x.py",
+                    }
+                ]
+            ],
+            "distances": [[0.1]],
+        }
+
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            result = search_memories("python", "/fake/path")
+
+        assert result["results"][0]["hall"] == "technical"
 
     def test_created_at_contains_filed_at(self, palace_path, seeded_collection):
         """created_at surfaces the filed_at metadata from the drawer."""
@@ -137,6 +162,7 @@ class TestSearchMemories:
         assert none_hit["text"] == "second doc"
         assert none_hit["wing"] == "unknown"
         assert none_hit["room"] == "unknown"
+        assert none_hit["hall"] == ""
 
     def test_effective_distance_clamped_to_valid_cosine_range(self):
         """A strong closet boost (up to 0.40) applied to a low-distance drawer

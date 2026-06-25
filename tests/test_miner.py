@@ -943,6 +943,47 @@ def test_sqlite_wing_room_counts_returns_none_on_locked_db(palace_path, seeded_c
         assert _sqlite_wing_room_counts(palace_path, "mempalace_drawers") is None
 
 
+def test_process_file_marks_project_file_drawers_as_code_hall(tmp_path, monkeypatch):
+    from mempalace import miner
+
+    class FakeCol:
+        def __init__(self):
+            self.metadatas = []
+
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            pass
+
+        def upsert(self, documents, ids, metadatas):
+            self.metadatas.extend(metadatas)
+
+    source = tmp_path / "service.py"
+    source.write_text("def fix_bug():\n    return api_handler()\n", encoding="utf-8")
+    chunks = [{"content": "python function bug api handler", "chunk_index": 0}]
+    col = FakeCol()
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
+    monkeypatch.setattr(miner, "detect_hall", lambda content: "technical")
+    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+
+    drawers, room, skip_reason = miner.process_file(
+        source,
+        tmp_path,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+        min_chunk_size=1,
+    )
+
+    assert drawers == 1
+    assert room == "general"
+    assert skip_reason is None
+    assert col.metadatas[0]["hall"] == "code"
+
+
 def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
     from mempalace import miner
 

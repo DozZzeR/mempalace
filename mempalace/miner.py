@@ -1203,6 +1203,7 @@ def _build_drawer_metadata(
     line_start: Optional[int] = None,
     line_end: Optional[int] = None,
     content_date: Optional[str] = None,
+    hall_override: Optional[str] = None,
 ) -> dict:
     """Build the metadata dict for one drawer without upserting.
 
@@ -1237,7 +1238,7 @@ def _build_drawer_metadata(
         metadata["line_end"] = line_end
     if content_date:
         metadata["content_date"] = content_date
-    metadata["hall"] = detect_hall(content)
+    metadata["hall"] = hall_override or detect_hall(content)
     entities = _extract_entities_for_metadata(content)
     if entities:
         metadata["entities"] = entities
@@ -1401,6 +1402,7 @@ def process_file(
                         line_start=chunk.get("line_start"),
                         line_end=chunk.get("line_end"),
                         content_date=file_content_date,
+                        hall_override="code",
                     )
                 )
             assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)

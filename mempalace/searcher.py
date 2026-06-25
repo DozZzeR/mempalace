@@ -629,6 +629,7 @@ def _bm25_only_via_sqlite(
                 "text": d["text"],
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
+                "hall": meta.get("hall", ""),
                 "source_file": Path(full_source).name if full_source else "?",
                 "created_at": meta.get("filed_at", "unknown"),
                 # No vector distance available in BM25-only mode.
@@ -729,6 +730,7 @@ def _merge_bm25_union_candidates(
                 "text": hit.document or "",
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
+                "hall": meta.get("hall", ""),
                 "source_file": Path(full_source).name if full_source else "?",
                 "created_at": meta.get("filed_at", "unknown"),
                 "similarity": None,
@@ -1118,6 +1120,7 @@ def search_memories(
             "text": doc,
             "wing": meta.get("wing", "unknown"),
             "room": meta.get("room", "unknown"),
+            "hall": meta.get("hall", ""),
             "source_file": Path(source).name if source else "?",
             "created_at": meta.get("filed_at", "unknown"),
             "similarity": round(_distance_to_similarity(effective_dist, metric), 3),

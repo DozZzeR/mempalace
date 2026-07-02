@@ -15,6 +15,7 @@ Tools (read):
 Tools (write):
   mempalace_add_drawer      — file verbatim content into a wing/room
   mempalace_delete_drawer   — remove a drawer by ID
+  mempalace_api_ingest_*    — stage API docs, prepare them, and mine them
 
 Tools (maintenance):
   mempalace_reconnect       — force cache invalidation and reconnect after external writes
@@ -50,7 +51,7 @@ import hashlib  # noqa: E402
 import sqlite3  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
-from datetime import date, datetime  # noqa: E402
+from datetime import date, datetime, timezone  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Optional  # noqa: E402
 
@@ -1812,6 +1813,226 @@ def tool_mine(
             _metadata_cache = None
 
 
+def tool_api_ingest_add_file(
+    provider: str,
+    filename: str,
+    content: str = None,
+    content_base64: str = None,
+    batch_id: str = None,
+    source_url: str = None,
+):
+    """Stage one raw external API documentation file for later processing."""
+    try:
+        from .api_ingest import add_file
+
+        return add_file(
+            palace_path=_config.palace_path,
+            provider=provider,
+            filename=filename,
+            content=content,
+            content_base64=content_base64,
+            batch_id=batch_id,
+            source_url=source_url,
+        )
+    except Exception as exc:
+        logger.exception("api ingest add_file failed")
+        return {"success": False, "error": str(exc), "error_class": type(exc).__name__}
+
+
+_API_INGEST_JOBS = {}
+_API_INGEST_JOB_LOCK = threading.Lock()
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _api_ingest_job_snapshot(job: dict) -> dict:
+    snap = dict(job)
+    return snap
+
+
+def _api_ingest_job_update(job_id: str, **updates) -> None:
+    with _API_INGEST_JOB_LOCK:
+        job = _API_INGEST_JOBS.get(job_id)
+        if job is None:
+            return
+        job.update(updates)
+        job["updated_at"] = _utc_now_iso()
+
+
+def _run_api_ingest_process(
+    batch_id: str,
+    wing: str = None,
+    agent: str = "api_ingest",
+    dry_run: bool = False,
+    limit: int = 0,
+) -> dict:
+    try:
+        from .api_ingest import process_batch
+
+        prepared = process_batch(_config.palace_path, batch_id, wing=wing)
+    except Exception as exc:
+        logger.exception("api ingest process failed")
+        return {"success": False, "error": str(exc), "error_class": type(exc).__name__}
+
+    if not prepared.get("success"):
+        return prepared
+
+    mine_result = tool_mine(
+        source=prepared["prepared_dir"],
+        mode="projects",
+        wing=prepared["wing"],
+        agent=agent,
+        limit=limit,
+        dry_run=dry_run,
+    )
+    return {
+        "success": bool(mine_result.get("success")),
+        "batch_id": prepared["batch_id"],
+        "provider": prepared["provider"],
+        "wing": prepared["wing"],
+        "rooms": prepared["rooms"],
+        "prepared_dir": prepared["prepared_dir"],
+        "prepared_files": prepared["prepared_files"],
+        "mine": mine_result,
+    }
+
+
+def _api_ingest_job_worker(job_id: str) -> None:
+    with _API_INGEST_JOB_LOCK:
+        job = _API_INGEST_JOBS.get(job_id)
+        if job is None:
+            return
+        params = dict(job["params"])
+        job["status"] = "running"
+        job["started_at"] = _utc_now_iso()
+        job["updated_at"] = job["started_at"]
+
+    result = _run_api_ingest_process(**params)
+    if result.get("success"):
+        _api_ingest_job_update(
+            job_id,
+            status="succeeded",
+            completed_at=_utc_now_iso(),
+            result=result,
+            error=None,
+            error_class=None,
+        )
+        return
+    _api_ingest_job_update(
+        job_id,
+        status="failed",
+        completed_at=_utc_now_iso(),
+        result=result,
+        error=result.get("error", "api ingest job failed"),
+        error_class=result.get("error_class", "ApiIngestError"),
+    )
+
+
+def _start_api_ingest_job(
+    *,
+    batch_id: str,
+    wing: str = None,
+    agent: str = "api_ingest",
+    dry_run: bool = False,
+    limit: int = 0,
+) -> dict:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    seed = f"{batch_id}:{wing or ''}:{agent}:{dry_run}:{limit}:{time.time_ns()}"
+    job_id = f"api_ingest_{stamp}_{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:12]}"
+    now = _utc_now_iso()
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "batch_id": batch_id,
+        "wing": wing,
+        "agent": agent,
+        "dry_run": dry_run,
+        "limit": limit,
+        "created_at": now,
+        "updated_at": now,
+        "started_at": None,
+        "completed_at": None,
+        "params": {
+            "batch_id": batch_id,
+            "wing": wing,
+            "agent": agent,
+            "dry_run": dry_run,
+            "limit": limit,
+        },
+        "result": None,
+        "error": None,
+        "error_class": None,
+    }
+    with _API_INGEST_JOB_LOCK:
+        _API_INGEST_JOBS[job_id] = job
+    thread = threading.Thread(
+        target=_api_ingest_job_worker,
+        args=(job_id,),
+        name=f"mempalace-api-ingest-{job_id}",
+        daemon=True,
+    )
+    thread.start()
+    return _api_ingest_job_snapshot(job)
+
+
+def tool_api_ingest_process(
+    batch_id: str,
+    wing: str = None,
+    agent: str = "api_ingest",
+    dry_run: bool = False,
+    limit: int = 0,
+    background: bool = False,
+):
+    """Prepare a staged API documentation batch and mine the prepared output."""
+    if background:
+        job = _start_api_ingest_job(
+            batch_id=batch_id,
+            wing=wing,
+            agent=agent,
+            dry_run=dry_run,
+            limit=limit,
+        )
+        return {
+            "success": True,
+            "accepted": True,
+            "job_id": job["job_id"],
+            "status": job["status"],
+            "batch_id": batch_id,
+            "wing": wing,
+            "created_at": job["created_at"],
+            "status_tool": "mempalace_api_ingest_job_status",
+        }
+    return _run_api_ingest_process(
+        batch_id=batch_id,
+        wing=wing,
+        agent=agent,
+        dry_run=dry_run,
+        limit=limit,
+    )
+
+
+def tool_api_ingest_job_status(job_id: str = None, batch_id: str = None):
+    """Return status for background API ingest jobs."""
+    with _API_INGEST_JOB_LOCK:
+        if job_id:
+            job = _API_INGEST_JOBS.get(job_id)
+            if job is None:
+                return {
+                    "success": False,
+                    "error": f"api ingest job not found: {job_id}",
+                    "error_class": "NotFound",
+                }
+            return {"success": True, **_api_ingest_job_snapshot(job)}
+        jobs = [
+            _api_ingest_job_snapshot(job)
+            for job in _API_INGEST_JOBS.values()
+            if batch_id is None or job.get("batch_id") == batch_id
+        ]
+    return {"success": True, "jobs": jobs}
+
+
 def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
     """Prune drawers whose source files are gitignored, missing, or moved (#1252)."""
     global _metadata_cache
@@ -2980,6 +3201,108 @@ TOOLS = {
             "required": ["source"],
         },
         "handler": tool_mine,
+    },
+    "mempalace_api_ingest_add_file": {
+        "description": (
+            "Stage one external API documentation file for later processing. "
+            "Call once per file, passing file bytes/content directly instead of a "
+            "local source path. The raw file is stored verbatim under the active "
+            "palace; use content_base64 for exact binary bytes, or content for UTF-8 "
+            "text. Returns a batch_id to reuse for additional files, then call "
+            "mempalace_api_ingest_process."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "provider": {
+                    "type": "string",
+                    "description": "External API provider name, e.g. megaplan or ideal13.megaplan.ru.",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Original filename without path components.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Raw UTF-8 text content. Do not summarize or rewrite.",
+                },
+                "content_base64": {
+                    "type": "string",
+                    "description": "Base64 encoded raw bytes. Preferred for agent uploads and exact binary transfer.",
+                },
+                "batch_id": {
+                    "type": "string",
+                    "description": "Existing batch_id returned by a previous add_file call.",
+                },
+                "source_url": {
+                    "type": "string",
+                    "description": "Optional original documentation URL for provenance.",
+                },
+            },
+            "required": ["provider", "filename"],
+        },
+        "handler": tool_api_ingest_add_file,
+    },
+    "mempalace_api_ingest_process": {
+        "description": (
+            "Prepare a staged API documentation batch into API-oriented rooms and "
+            "start normal MemPalace mining from palace-owned storage. Returns expected wing and rooms. "
+            "Default wing is api_<provider>; pass wing to attach docs to a project."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "batch_id": {
+                    "type": "string",
+                    "description": "Batch id returned by mempalace_api_ingest_add_file.",
+                },
+                "wing": {
+                    "type": "string",
+                    "description": "Optional target wing. If omitted, api_<provider> is used.",
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Recorded as the mining agent. Default: api_ingest.",
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Prepare files and preview mining without filing drawers.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max prepared files to mine (0 = all). Default: 0.",
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": (
+                        "Return immediately with a job_id and run processing in a background "
+                        "thread. Poll mempalace_api_ingest_job_status for completion."
+                    ),
+                },
+            },
+            "required": ["batch_id"],
+        },
+        "handler": tool_api_ingest_process,
+    },
+    "mempalace_api_ingest_job_status": {
+        "description": (
+            "Check background API ingest job status. Pass job_id for one job, "
+            "or batch_id to list matching jobs. Jobs are in-memory for the current MCP server process."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "job_id": {
+                    "type": "string",
+                    "description": "Job id returned by mempalace_api_ingest_process with background=true.",
+                },
+                "batch_id": {
+                    "type": "string",
+                    "description": "Optional batch id filter when listing jobs.",
+                },
+            },
+        },
+        "handler": tool_api_ingest_job_status,
     },
     "mempalace_sync": {
         "description": "Prune drawers whose source files are gitignored, deleted, or moved. Returns dry-run report by default; pass apply=true to commit deletions.",

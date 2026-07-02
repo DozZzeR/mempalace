@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 31 MCP tools.
+Detailed parameter schemas for all 39 MCP tools.
 
 ## Palace — Read Tools
 
@@ -84,6 +84,40 @@ Returns the AAAK dialect specification.
 
 ---
 
+### `mempalace_get_operating_guide`
+
+Returns the MemPalace operating guide through the tools surface.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `wing` | string | No | Optional wing override for the session guide |
+
+**Returns:** `{ name, description, text }`
+
+---
+
+### `mempalace_get_project_guide`
+
+Returns the technical project guide through the tools surface.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_name` | string | **Yes** | Project name used to derive the active MemPalace wing |
+
+**Returns:** `{ name, description, text }`
+
+---
+
+### `mempalace_get_family_guide`
+
+Returns the family/private guide through the tools surface.
+
+**Parameters:** None
+
+**Returns:** `{ name, description, text }`
+
+---
+
 ## Palace — Write Tools
 
 ### `mempalace_add_drawer`
@@ -129,6 +163,64 @@ Mine a directory into the palace — the MCP equivalent of `mempalace mine`. Wra
 | `extract` | string | No | Convos extraction strategy: `exchange` (default) or `general`; ignored by other modes |
 
 **Returns:** `{ success, mode, dry_run, output }` on success (`output` is the miner's human-readable summary; `output_truncated: true` is added when a very large summary is tail-trimmed), or `{ success: false, error, error_class? }` on failure.
+
+---
+
+### `mempalace_api_ingest_add_file`
+
+Stage one external API documentation file for later processing. Agents should
+pass file bytes or text directly with this tool instead of handing MemPalace a
+local filesystem path. Call once per file; reuse the returned `batch_id` for
+additional files in the same batch. Raw content is stored under the active
+palace before any prepared derivative is created.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `provider` | string | **Yes** | External API provider name, e.g. `megaplan` |
+| `filename` | string | **Yes** | Original filename without path components |
+| `content` | string | No | Raw UTF-8 text content |
+| `content_base64` | string | No | Base64 encoded raw bytes; preferred for exact agent uploads |
+| `batch_id` | string | No | Existing batch ID from a previous add-file call |
+| `source_url` | string | No | Original docs URL for provenance |
+
+**Returns:** `{ success, provider, batch_id, filename, raw_path, raw_sha256, size_bytes }` or `{ success: false, error, error_class }`
+
+---
+
+### `mempalace_api_ingest_process`
+
+Prepare a staged API documentation batch into API-oriented rooms and start
+normal MemPalace mining from palace-owned storage. If `wing` is omitted, the
+target wing is `api_<provider>`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `batch_id` | string | **Yes** | Batch ID returned by `mempalace_api_ingest_add_file` |
+| `wing` | string | No | Target wing; pass a project wing to attach docs to that project |
+| `agent` | string | No | Agent recorded by the miner (default: `api_ingest`) |
+| `dry_run` | boolean | No | Prepare files and preview mining without filing drawers |
+| `limit` | integer | No | Max prepared files to mine (0 = all) |
+| `background` | boolean | No | Return immediately with a `job_id`; poll `mempalace_api_ingest_job_status` |
+
+**Returns:** synchronous mode returns `{ success, batch_id, provider, wing, rooms, prepared_dir, prepared_files, mine }`.
+With `background: true`, returns `{ success, accepted, job_id, status, batch_id, wing, created_at, status_tool }`.
+
+Prepared rooms include `api_endpoints`, `api_schemas`, `api_guides`,
+`api_quirks`, and `api_raw` as needed.
+
+---
+
+### `mempalace_api_ingest_job_status`
+
+Check background API ingest job status. Jobs are in-memory for the current MCP
+server process.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `job_id` | string | No | Job ID returned by `mempalace_api_ingest_process` with `background: true` |
+| `batch_id` | string | No | Optional batch ID filter when listing jobs |
+
+**Returns:** `{ success, job_id, status, batch_id, wing, agent, dry_run, limit, created_at, updated_at, started_at, completed_at, result, error, error_class }` for a single job, or `{ success, jobs }`.
 
 ---
 
